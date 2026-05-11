@@ -60,15 +60,19 @@ def fetch_returns(etf_list: list[dict]) -> pd.DataFrame:
         end=(today + timedelta(days=1)).isoformat(),
         auto_adjust=True,          # adjusted close includes dividends
         progress=False,
-        group_by="ticker",
-        threads=True,
     )
 
     # Build a clean Close dataframe: columns = tickers
-    if len(tickers) == 1:
-        close = raw[["Close"]].rename(columns={"Close": tickers[0]})
+    # yfinance returns MultiIndex (Price, Ticker) for multiple tickers
+    if isinstance(raw.columns, pd.MultiIndex):
+        close = raw["Close"] if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
     else:
-        close = raw["Close"]
+        # Single ticker
+        close = raw[["Close"]].rename(columns={"Close": tickers[0]}) if "Close" in raw.columns else pd.DataFrame()
+
+    if close.empty:
+        log.error("No close price data returned from yfinance.")
+        return pd.DataFrame()
 
     close = close.dropna(how="all")
 

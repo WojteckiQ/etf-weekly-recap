@@ -27,7 +27,7 @@ ETF_UNIVERSE = [
     {"ticker": "VEUR.AS", "name": "Vanguard FTSE Dev Europe",           "ter": 0.0012, "currency": "EUR"},
     {"ticker": "DXET.DE", "name": "Xtrackers Euro Stoxx 50",            "ter": 0.0009, "currency": "EUR"},
     {"ticker": "MEUD.PA", "name": "Lyxor Core MSCI EMU",                "ter": 0.0012, "currency": "EUR"},
-    {"ticker": "SMEA.PA", "name": "iShares Core MSCI EMU",              "ter": 0.0012, "currency": "EUR"},
+    {"ticker": "IQQE.DE", "name": "iShares Core MSCI EMU",              "ter": 0.0012, "currency": "EUR"},
 
     # === Emerging Markets ===
     {"ticker": "IEMA.L",  "name": "iShares MSCI EM (LON)",              "ter": 0.0018, "currency": "USD"},
