@@ -1,307 +1,546 @@
 #!/usr/bin/env python3
 """
-ETF Weekly Recap
-Fetches performance for 5d / 3m / YTD / 1Y periods (dividends included via
-adjusted close prices), adjusts for TER, and emails an HTML summary.
+ETF Weekly Performance Report — PDF edition
+Generates a multi-page PDF report and emails it as an attachment.
+
+Pages:
+  1. Cover  — top-5 bar charts per period (5d / 3m / YTD / 1Y)
+  2–N. Category pages — metrics table + grouped bar chart per ETF cluster
+  N+1. Trend chart  — cumulative return (top-8 ETFs, 3-month window)
+  N+2. Heatmap      — all ETFs × all periods, colour-coded
 
 Required env vars:
-  SMTP_HOST        e.g. smtp.gmail.com
-  SMTP_PORT        e.g. 587
-  SMTP_USER        sender address
-  SMTP_PASS        SMTP password / app password
-  EMAIL_RECIPIENT  recipient address (comma-separated for multiple)
+  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_RECIPIENT
 """
 
-import os
-import sys
-import smtplib
+import io
 import logging
+import os
+import smtplib
+import sys
 from datetime import date, timedelta
+from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import yfinance as yf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import numpy as np
 import pandas as pd
+import yfinance as yf
 
 from etfs import ETF_UNIVERSE
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TOP_N = 5          # winners to highlight per period
-PERIODS = {
-    "5 Days":    5,
-    "3 Months":  91,
-    "YTD":       None,   # handled separately
-    "1 Year":    365,
-}
+# ── Theme ─────────────────────────────────────────────────────────────────────
+NAVY   = "#1a1a2e"
+GOLD   = "#f5c518"
+GREEN  = "#27ae60"
+RED    = "#e74c3c"
+GRAY   = "#888888"
+WHITE  = "#ffffff"
+LIGHT  = "#f5f7fa"
+BLUE4  = ["#4a90d9", "#e67e22", "#9b59b6", "#2ecc71"]   # 4 period colours
+
+FIGSIZE = (16.5, 11.0)   # A4 landscape (inches)
+DPI     = 150
+TOP_N   = 5
+BENCHMARK = "IWDA.AS"
+
+PERIOD_DAYS   = {"5d": 5, "3m": 91, "YTD": None, "1Y": 365}
+PERIOD_LABELS = {"5d": "5 Days", "3m": "3 Months", "YTD": "Year-to-Date", "1Y": "1 Year"}
+
+CATEGORY_ORDER = [
+    "Global", "US Broad", "Nasdaq / Tech", "Europe",
+    "Emerging Markets", "Small Cap", "Bonds", "Commodities", "Thematic",
+]
 
 
-# ── Data ──────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _ytd_start() -> date:
-    today = date.today()
-    return date(today.year, 1, 1)
+def _ytd_days() -> int:
+    t = date.today()
+    return (t - date(t.year, 1, 1)).days or 1
 
 
-def fetch_returns(etf_list: list[dict]) -> pd.DataFrame:
-    """Download adjusted-close history and compute period returns + simulated annual perf."""
-    tickers = [e["ticker"] for e in etf_list]
-    today = date.today()
+def _fv(val, fmt="+.1f", suffix="%") -> str:
+    """Format a float value; returns '—' for None/NaN."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return "—"
+    return f"{val:{fmt}}{suffix}"
 
-    # Fetch 400 days so all periods are covered in one call
-    start = today - timedelta(days=400)
-    log.info("Downloading %d tickers from %s to %s …", len(tickers), start, today)
 
-    raw = yf.download(
-        tickers,
-        start=start.isoformat(),
-        end=(today + timedelta(days=1)).isoformat(),
-        auto_adjust=True,          # adjusted close includes dividends
-        progress=False,
-    )
+def _tc(val, higher_is_better=True) -> str:
+    """Return GREEN/RED/GRAY text colour for a metric value."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return GRAY
+    pos = val >= 0 if higher_is_better else val <= 0
+    return GREEN if pos else RED
 
-    # Build a clean Close dataframe: columns = tickers
-    # yfinance returns MultiIndex (Price, Ticker) for multiple tickers
+
+def _header(fig, title: str, subtitle: str = "") -> None:
+    ax = fig.add_axes([0, 0.935, 1, 0.065])
+    ax.set_facecolor(NAVY)
+    ax.axis("off")
+    ax.text(0.018, 0.5, title, color=GOLD, fontsize=15, fontweight="bold", va="center")
+    if subtitle:
+        ax.text(0.982, 0.5, subtitle, color="white", fontsize=10,
+                ha="right", va="center", alpha=0.75)
+
+
+# ── Data layer ────────────────────────────────────────────────────────────────
+
+def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Download 400 days of adjusted-close history for every ETF.
+    Returns
+    -------
+    metrics : DataFrame — one row per ETF with all computed metrics
+    close   : DataFrame — daily adjusted close prices (date index, ticker columns)
+    """
+    tickers = [e["ticker"] for e in ETF_UNIVERSE]
+    today   = date.today()
+    start   = (today - timedelta(days=400)).isoformat()
+    end     = (today + timedelta(days=1)).isoformat()
+
+    log.info("Downloading %d tickers …", len(tickers))
+    raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
+
     if isinstance(raw.columns, pd.MultiIndex):
-        close = raw["Close"] if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
+        close = raw["Close"].copy() if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
     else:
-        # Single ticker
         close = raw[["Close"]].rename(columns={"Close": tickers[0]}) if "Close" in raw.columns else pd.DataFrame()
 
     if close.empty:
-        log.error("No close price data returned from yfinance.")
-        return pd.DataFrame()
+        log.error("yfinance returned no Close data.")
+        return pd.DataFrame(), pd.DataFrame()
 
     close = close.dropna(how="all")
 
-    results = []
-    for etf in etf_list:
-        ticker = etf["ticker"]
-        ter = etf["ter"]          # annual cost as decimal (e.g. 0.002 = 0.20%)
+    # Benchmark daily returns for beta computation
+    bm_ret = close[BENCHMARK].pct_change().dropna() if BENCHMARK in close.columns else None
 
-        if ticker not in close.columns:
-            log.warning("No data for %s — skipping", ticker)
+    rows = []
+    for etf in ETF_UNIVERSE:
+        t = etf["ticker"]
+        if t not in close.columns:
+            log.warning("No data for %s — skipping", t)
+            continue
+        s = close[t].dropna()
+        if len(s) < 10:
             continue
 
-        series = close[ticker].dropna()
-        if len(series) < 6:
-            log.warning("Insufficient data for %s — skipping", ticker)
-            continue
-
-        current_price = float(series.iloc[-1])
-        row = {
-            "Ticker": ticker,
-            "Name": etf["name"],
-            "TER (%)": round(ter * 100, 2),
-            "Price": round(current_price, 2),
-            "Currency": etf["currency"],
+        cur = float(s.iloc[-1])
+        row: dict = {
+            "Ticker":   t,
+            "Name":     etf["name"],
+            "Category": etf["category"],
+            "TER":      etf["ter"],
+            "Price":    cur,
         }
 
-        period_days = {
-            "5 Days":   5,
-            "3 Months": 91,
-            "YTD":      (date.today() - _ytd_start()).days,
-            "1 Year":   365,
-        }
-
-        for label, days in period_days.items():
-            target_date = today - timedelta(days=days)
-            # Pick closest available date on or before target
-            subset = series[series.index.date <= target_date]
-            if subset.empty:
-                row[f"Return {label} (%)"] = None
-                row[f"Sim Annual {label} (%)"] = None
+        # Period returns & simulated annual net return
+        for key, days in PERIOD_DAYS.items():
+            if days is None:
+                days = _ytd_days()
+            target = today - timedelta(days=days)
+            sub = s[s.index.date <= target]
+            if sub.empty:
+                row[f"ret_{key}"] = np.nan
+                row[f"sim_{key}"] = np.nan
                 continue
+            gross  = cur / float(sub.iloc[-1]) - 1
+            annual = (1 + gross) ** (365.0 / days) - 1
+            row[f"ret_{key}"] = gross  * 100
+            row[f"sim_{key}"] = (annual - etf["ter"]) * 100
 
-            start_price = float(subset.iloc[-1])
-            gross_return = (current_price / start_price) - 1.0
+        # Annualised volatility (daily σ × √252)
+        daily = s.pct_change().dropna()
+        row["vol"] = float(daily.std() * np.sqrt(252) * 100)
 
-            # Annualise and subtract TER
-            ann_factor = 365.0 / max(days, 1)
-            annualized_gross = (1 + gross_return) ** ann_factor - 1
-            sim_annual = annualized_gross - ter
+        # Max drawdown over the last year
+        s1y = s[s.index >= pd.Timestamp(today - timedelta(days=365))]
+        if len(s1y) > 1:
+            roll_max = s1y.cummax()
+            row["max_dd"] = float(((s1y - roll_max) / roll_max).min() * 100)
+        else:
+            row["max_dd"] = np.nan
 
-            row[f"Return {label} (%)"] = round(gross_return * 100, 2)
-            row[f"Sim Annual {label} (%)"] = round(sim_annual * 100, 2)
+        # Beta vs benchmark
+        if bm_ret is not None and t != BENCHMARK:
+            aligned = pd.concat([daily, bm_ret], axis=1).dropna()
+            aligned.columns = ["etf", "bm"]
+            if len(aligned) >= 20:
+                cov = np.cov(aligned["etf"], aligned["bm"])
+                row["beta"] = float(cov[0, 1] / cov[1, 1])
+            else:
+                row["beta"] = np.nan
+        else:
+            row["beta"] = 1.0 if t == BENCHMARK else np.nan
 
-        results.append(row)
+        # 52-week range position (0 = at 52w low, 100 = at 52w high)
+        s52 = s[s.index >= pd.Timestamp(today - timedelta(days=365))]
+        if len(s52) > 1:
+            lo, hi = float(s52.min()), float(s52.max())
+            row["range_pct"] = (cur - lo) / (hi - lo) * 100 if hi > lo else 50.0
+        else:
+            row["range_pct"] = np.nan
 
-    return pd.DataFrame(results)
+        rows.append(row)
 
-
-# ── Email ─────────────────────────────────────────────────────────────────────
-
-_COLORS = {
-    "header_bg":  "#1a1a2e",
-    "header_fg":  "#e0e0e0",
-    "gold":       "#f5c518",
-    "silver":     "#c0c0c0",
-    "bronze":     "#cd7f32",
-    "pos":        "#27ae60",
-    "neg":        "#e74c3c",
-    "row_even":   "#f8f9fa",
-    "row_odd":    "#ffffff",
-    "border":     "#dee2e6",
-    "text":       "#212529",
-    "subtitle":   "#6c757d",
-}
-
-MEDAL = {0: "🥇", 1: "🥈", 2: "🥉"}
-
-
-def _pct(val):
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return "N/A"
-    color = _COLORS["pos"] if val >= 0 else _COLORS["neg"]
-    sign = "+" if val >= 0 else ""
-    return f'<span style="color:{color};font-weight:600">{sign}{val:.2f}%</span>'
+    return pd.DataFrame(rows), close
 
 
-def _build_winners_block(df: pd.DataFrame, period: str) -> str:
-    col_ret = f"Return {period} (%)"
-    col_sim = f"Sim Annual {period} (%)"
-    if col_ret not in df.columns:
-        return ""
+# ── PDF pages ─────────────────────────────────────────────────────────────────
 
-    top = df.dropna(subset=[col_ret]).nlargest(TOP_N, col_ret).reset_index(drop=True)
-    if top.empty:
-        return ""
+def page_cover(pdf: PdfPages, df: pd.DataFrame) -> None:
+    """Page 1: Top-N horizontal bar charts, one per period (2×2 grid)."""
+    fig = plt.figure(figsize=FIGSIZE, facecolor=LIGHT)
+    _header(fig, "ETF Weekly Performance Report", date.today().strftime("%B %d, %Y"))
 
-    rows_html = ""
-    for i, r in top.iterrows():
-        medal = MEDAL.get(i, "")
-        bg = _COLORS["row_even"] if i % 2 == 0 else _COLORS["row_odd"]
-        rows_html += f"""
-        <tr style="background:{bg}">
-          <td style="padding:8px 12px;font-size:18px">{medal}</td>
-          <td style="padding:8px 12px;font-weight:600">{r['Ticker']}</td>
-          <td style="padding:8px 12px;color:{_COLORS['subtitle']};font-size:13px">{r['Name']}</td>
-          <td style="padding:8px 12px;text-align:right">{_pct(r[col_ret])}</td>
-          <td style="padding:8px 12px;text-align:right">{_pct(r[col_sim])}</td>
-          <td style="padding:8px 12px;text-align:right;color:{_COLORS['subtitle']}">{r['TER (%)']:.2f}%</td>
-        </tr>"""
+    positions = [
+        [0.04, 0.49, 0.44, 0.42],   # 5d   — top-left
+        [0.53, 0.49, 0.44, 0.42],   # 3m   — top-right
+        [0.04, 0.05, 0.44, 0.42],   # YTD  — bottom-left
+        [0.53, 0.05, 0.44, 0.42],   # 1Y   — bottom-right
+    ]
 
-    return f"""
-    <h3 style="margin:24px 0 8px;color:{_COLORS['header_bg']};border-bottom:2px solid {_COLORS['gold']};
-               padding-bottom:4px">Best performers — {period}</h3>
-    <table width="100%" cellspacing="0" cellpadding="0"
-           style="border-collapse:collapse;border:1px solid {_COLORS['border']};border-radius:6px;overflow:hidden">
-      <thead>
-        <tr style="background:{_COLORS['header_bg']};color:{_COLORS['header_fg']}">
-          <th style="padding:8px 12px;width:30px"></th>
-          <th style="padding:8px 12px;text-align:left">Ticker</th>
-          <th style="padding:8px 12px;text-align:left">Name</th>
-          <th style="padding:8px 12px;text-align:right">Period Return</th>
-          <th style="padding:8px 12px;text-align:right">Sim. Annual Net</th>
-          <th style="padding:8px 12px;text-align:right">TER</th>
-        </tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>"""
+    for pos, key in zip(positions, ["5d", "3m", "YTD", "1Y"]):
+        col = f"ret_{key}"
+        if col not in df.columns:
+            continue
+        top = df.dropna(subset=[col]).nlargest(TOP_N, col).reset_index(drop=True)
+        if top.empty:
+            continue
+
+        ax = fig.add_axes(pos)
+        ax.set_facecolor(WHITE)
+
+        colours = [GREEN if v >= 0 else RED for v in top[col]]
+        bars = ax.barh(top["Ticker"], top[col], color=colours, height=0.55, zorder=2)
+        ax.axvline(0, color=GRAY, lw=0.8, zorder=3)
+
+        for bar, v in zip(bars, top[col]):
+            pad = 0.08
+            ha  = "left" if v >= 0 else "right"
+            ax.text(v + (pad if v >= 0 else -pad), bar.get_y() + bar.get_height() / 2,
+                    f"{v:+.2f}%", va="center", ha=ha, fontsize=8.5,
+                    fontweight="bold", color=GREEN if v >= 0 else RED)
+
+        ax.set_title(f"Best {TOP_N} — {PERIOD_LABELS[key]}",
+                     fontweight="bold", color=NAVY, fontsize=11, pad=6)
+        ax.tick_params(axis="both", labelsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.set_xlabel("Total Return (%)", fontsize=8, color=GRAY)
+        ax.grid(axis="x", alpha=0.25, zorder=1)
+
+    fig.text(0.5, 0.016,
+             "Returns are dividend-adjusted (total return via adjusted close). "
+             "Sim. Annual Net subtracts the fund TER. Past performance is not indicative of future results. Not financial advice.",
+             ha="center", fontsize=7.5, color=GRAY)
+
+    pdf.savefig(fig, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
 
 
-def _build_full_table(df: pd.DataFrame) -> str:
-    sort_col = "Sim Annual 1 Year (%)"
-    if sort_col not in df.columns:
-        sort_col = df.columns[-1]
-    sorted_df = df.sort_values(sort_col, ascending=False, na_position="last").reset_index(drop=True)
+def page_category(pdf: PdfPages, category: str, cat_df: pd.DataFrame, close: pd.DataFrame) -> None:
+    """One page per category: metrics table (top) + grouped bar chart (bottom)."""
+    cat_df = cat_df.sort_values("ret_1Y", ascending=False, na_position="last").copy()
+    n = len(cat_df)
 
-    header_cells = "".join(
-        f'<th style="padding:7px 10px;text-align:right;white-space:nowrap">{c}</th>'
-        for c in ["Ticker", "Name", "TER", "5d", "3m", "YTD", "1Y", "Sim 1Y net"]
+    fig = plt.figure(figsize=FIGSIZE, facecolor=LIGHT)
+    _header(fig, f"Category — {category}", date.today().strftime("%B %d, %Y"))
+
+    # ── Table ─────────────────────────────────────────────────────────────────
+    ax_tbl = fig.add_axes([0.01, 0.37, 0.98, 0.55])
+    ax_tbl.axis("off")
+
+    COLS = ["Ticker", "Name", "TER %", "5d %", "3m %", "YTD %", "1Y %",
+            "Sim 1Y %", "Vol %", "MaxDD %", "Beta", "52wk Pos"]
+
+    cell_text   = []
+    cell_bg     = []
+    text_colors = []
+
+    for i, (_, r) in enumerate(cat_df.iterrows()):
+        v5d   = r.get("ret_5d");   v3m  = r.get("ret_3m")
+        vYTD  = r.get("ret_YTD"); v1Y  = r.get("ret_1Y")
+        vsim  = r.get("sim_1Y");  vvol = r.get("vol")
+        vdd   = r.get("max_dd");  vbet = r.get("beta")
+        vrng  = r.get("range_pct")
+
+        row_vals = [
+            r["Ticker"],
+            r["Name"][:32],
+            f"{r['TER']*100:.2f}",
+            _fv(v5d),  _fv(v3m), _fv(vYTD), _fv(v1Y),
+            _fv(vsim),
+            _fv(vvol, ".1f"),
+            _fv(vdd),
+            _fv(vbet, ".2f", ""),
+            _fv(vrng, ".0f"),
+        ]
+        cell_text.append(row_vals)
+
+        bg = "#eef2f7" if i % 2 == 0 else WHITE
+        cell_bg.append([bg] * len(COLS))
+
+        text_colors.append([
+            NAVY, "#333333", GRAY,
+            _tc(v5d), _tc(v3m), _tc(vYTD), _tc(v1Y),
+            _tc(vsim),
+            GRAY,
+            _tc(vdd, higher_is_better=False),
+            GRAY, GRAY,
+        ])
+
+    tbl = ax_tbl.table(
+        cellText=cell_text,
+        colLabels=COLS,
+        cellColours=cell_bg,
+        loc="upper center",
+        cellLoc="center",
     )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8.5)
+    tbl.scale(1, max(1.6, 9.5 / (n + 1)))
 
-    rows_html = ""
-    for i, r in sorted_df.iterrows():
-        bg = _COLORS["row_even"] if i % 2 == 0 else _COLORS["row_odd"]
-        rows_html += f"""
-        <tr style="background:{bg};font-size:12px">
-          <td style="padding:6px 10px;font-weight:600">{r['Ticker']}</td>
-          <td style="padding:6px 10px;color:{_COLORS['subtitle']}">{r['Name']}</td>
-          <td style="padding:6px 10px;text-align:right">{r['TER (%)']:.2f}%</td>
-          <td style="padding:6px 10px;text-align:right">{_pct(r.get('Return 5 Days (%)'))}</td>
-          <td style="padding:6px 10px;text-align:right">{_pct(r.get('Return 3 Months (%)'))}</td>
-          <td style="padding:6px 10px;text-align:right">{_pct(r.get('Return YTD (%)'))}</td>
-          <td style="padding:6px 10px;text-align:right">{_pct(r.get('Return 1 Year (%)'))}</td>
-          <td style="padding:6px 10px;text-align:right">{_pct(r.get('Sim Annual 1 Year (%)'))}</td>
-        </tr>"""
+    for j in range(len(COLS)):
+        hdr = tbl[(0, j)]
+        hdr.set_facecolor(NAVY)
+        hdr.get_text().set_color("white")
+        hdr.get_text().set_fontweight("bold")
 
-    return f"""
-    <h3 style="margin:32px 0 8px;color:{_COLORS['header_bg']};border-bottom:2px solid {_COLORS['border']};
-               padding-bottom:4px">Full scorecard (sorted by Sim. 1Y net)</h3>
-    <table width="100%" cellspacing="0" cellpadding="0"
-           style="border-collapse:collapse;border:1px solid {_COLORS['border']};font-size:12px">
-      <thead>
-        <tr style="background:{_COLORS['header_bg']};color:{_COLORS['header_fg']}">
-          {header_cells}
-        </tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>"""
+    for i, tc_row in enumerate(text_colors):
+        for j, color in enumerate(tc_row):
+            tbl[(i + 1, j)].get_text().set_color(color)
+        tbl[(i + 1, 7)].get_text().set_fontweight("bold")   # Sim 1Y bold
+
+    # ── Bar chart ─────────────────────────────────────────────────────────────
+    ax_bar = fig.add_axes([0.05, 0.05, 0.90, 0.29])
+    ax_bar.set_facecolor(WHITE)
+
+    tickers = cat_df["Ticker"].tolist()
+    x = np.arange(len(tickers))
+    w = 0.18
+
+    for j, (pkey, colour) in enumerate(zip(["5d", "3m", "YTD", "1Y"], BLUE4)):
+        col = f"ret_{pkey}"
+        vals = []
+        for t in tickers:
+            mask = cat_df["Ticker"] == t
+            v = cat_df.loc[mask, col].values[0] if col in cat_df.columns and mask.any() else np.nan
+            vals.append(0.0 if np.isnan(v) else v)
+        ax_bar.bar(x + (j - 1.5) * w, vals, width=w,
+                   label=PERIOD_LABELS[pkey], color=colour, alpha=0.85, zorder=2)
+
+    ax_bar.axhline(0, color=GRAY, lw=0.8, zorder=3)
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(tickers, fontsize=9, fontweight="bold")
+    ax_bar.set_ylabel("Return (%)", fontsize=9)
+    ax_bar.legend(fontsize=8.5, framealpha=0.5, ncol=4, loc="best")
+    ax_bar.spines[["top", "right"]].set_visible(False)
+    ax_bar.grid(axis="y", alpha=0.25, zorder=1)
+    ax_bar.set_title("Returns by Period (dividend-adjusted total return)",
+                     fontweight="bold", color=NAVY, fontsize=10)
+
+    pdf.savefig(fig, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
 
 
-def build_html(df: pd.DataFrame) -> str:
-    today_str = date.today().strftime("%B %d, %Y")
-    winners = "".join(_build_winners_block(df, p) for p in PERIODS)
-    full_table = _build_full_table(df)
+def page_trend(pdf: PdfPages, df: pd.DataFrame, close: pd.DataFrame) -> None:
+    """Normalized cumulative-return chart for top-8 ETFs (3-month window)."""
+    fig = plt.figure(figsize=FIGSIZE, facecolor=LIGHT)
+    _header(fig, "Cumulative Performance — Top 8 ETFs (3-Month Window)",
+            date.today().strftime("%B %d, %Y"))
 
-    note = (
-        "<p style='font-size:11px;color:#aaa;margin-top:24px'>"
-        "<b>Methodology:</b> Prices are dividend-adjusted (total return). "
-        "\"Sim. Annual Net\" annualises the gross period return then subtracts the fund TER. "
-        "Past performance is not indicative of future results. Not financial advice."
-        "</p>"
-    )
+    ax = fig.add_axes([0.06, 0.10, 0.91, 0.80])
+    ax.set_facecolor(WHITE)
 
-    return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-             color:{_COLORS['text']};background:#f4f4f4;padding:0;margin:0">
-  <div style="max-width:860px;margin:0 auto;background:#fff;border-radius:8px;
-              box-shadow:0 2px 12px rgba(0,0,0,.08);overflow:hidden">
+    top8    = df.dropna(subset=["ret_1Y"]).nlargest(8, "ret_1Y")
+    cutoff  = pd.Timestamp(date.today() - timedelta(days=91))
+    cmap    = plt.get_cmap("tab10")
 
-    <!-- Header -->
-    <div style="background:{_COLORS['header_bg']};padding:28px 32px">
-      <h1 style="margin:0;color:{_COLORS['gold']};font-size:24px">ETF Weekly Recap</h1>
-      <p style="margin:4px 0 0;color:{_COLORS['header_fg']};opacity:.7;font-size:14px">{today_str}</p>
-    </div>
+    for i, (_, row) in enumerate(top8.iterrows()):
+        t = row["Ticker"]
+        if t not in close.columns:
+            continue
+        s = close[t].dropna()
+        s = s[s.index >= cutoff]
+        if s.empty:
+            continue
+        rebased = s / float(s.iloc[0]) * 100
+        label   = f"{t}  {_fv(row['ret_1Y'])} 1Y"
+        ax.plot(rebased.index, rebased.values, lw=2.2, color=cmap(i), label=label)
+        # Annotate last value
+        ax.annotate(f"{float(rebased.iloc[-1]):.1f}",
+                    xy=(rebased.index[-1], float(rebased.iloc[-1])),
+                    xytext=(6, 0), textcoords="offset points",
+                    fontsize=8, color=cmap(i), va="center")
 
-    <div style="padding:24px 32px">
-      <p style="color:{_COLORS['subtitle']};font-size:14px;margin-top:0">
-        Top {TOP_N} best-performing ETFs across 4 time windows, dividend-adjusted and net of fees.
-      </p>
-      {winners}
-      <br>
-      {full_table}
-      {note}
-    </div>
-  </div>
-</body>
-</html>"""
+    ax.axhline(100, color=GRAY, lw=0.9, ls="--", alpha=0.7, label="Base (100)")
+    ax.set_ylabel("Indexed Price (100 = window start)", fontsize=10)
+    ax.set_xlabel("Date", fontsize=10)
+    ax.legend(fontsize=8.5, loc="upper left", framealpha=0.6, ncol=2)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", alpha=0.3)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}"))
+
+    fig.text(0.5, 0.025,
+             "Prices dividend-adjusted. Rebased to 100 at the start of the 3-month window. "
+             "Selection = top 8 ETFs by 1-year total return.",
+             ha="center", fontsize=8, color=GRAY)
+
+    pdf.savefig(fig, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def page_heatmap(pdf: PdfPages, df: pd.DataFrame) -> None:
+    """Full performance heatmap — all ETFs × all periods, grouped by category."""
+    HCOLS      = ["5d", "3m", "YTD", "1Y", "Sim 1Y net"]
+    DATA_COLS  = ["ret_5d", "ret_3m", "ret_YTD", "ret_1Y", "sim_1Y"]
+
+    # Build ordered list: sort by category then 1Y desc
+    ordered = []
+    for cat in CATEGORY_ORDER:
+        sub = df[df["Category"] == cat].sort_values("ret_1Y", ascending=False, na_position="last")
+        ordered.append(sub)
+    plot_df = pd.concat(ordered, ignore_index=True)
+
+    matrix  = plot_df[DATA_COLS].values.astype(float)
+    ylabels = [f"{r['Ticker']}  ({r['Category'][:5]})" for _, r in plot_df.iterrows()]
+
+    fig = plt.figure(figsize=FIGSIZE, facecolor=LIGHT)
+    _header(fig, "Performance Heatmap — All ETFs × All Periods",
+            date.today().strftime("%B %d, %Y"))
+
+    ax = fig.add_axes([0.14, 0.06, 0.74, 0.86])
+
+    vmax = np.nanpercentile(np.abs(matrix), 95)
+    im   = ax.imshow(matrix, aspect="auto", cmap="RdYlGn", vmin=-vmax, vmax=vmax, interpolation="nearest")
+
+    # Cell text
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            val = matrix[i, j]
+            if np.isnan(val):
+                continue
+            bright = abs(val) > vmax * 0.55
+            ax.text(j, i, f"{val:+.1f}%", ha="center", va="center",
+                    fontsize=7.5, fontweight="bold",
+                    color="white" if bright else "#222222")
+
+    # Category separator lines
+    count = 0
+    for cat in CATEGORY_ORDER:
+        count += len(plot_df[plot_df["Category"] == cat])
+        if count < len(plot_df):
+            ax.axhline(count - 0.5, color="white", lw=2)
+
+    ax.set_xticks(range(len(HCOLS)))
+    ax.set_xticklabels(HCOLS, fontweight="bold", fontsize=10)
+    ax.set_yticks(range(len(ylabels)))
+    ax.set_yticklabels(ylabels, fontsize=7.5)
+    ax.xaxis.set_ticks_position("top")
+    ax.xaxis.set_label_position("top")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.015)
+    cbar.set_label("Return (%)", fontsize=9)
+
+    # Category labels on right side
+    ax_right = ax.twinx()
+    ax_right.set_ylim(ax.get_ylim())
+    cat_ticks, cat_labels = [], []
+    count = 0
+    for cat in CATEGORY_ORDER:
+        n = len(plot_df[plot_df["Category"] == cat])
+        if n:
+            cat_ticks.append(count + n / 2 - 0.5)
+            cat_labels.append(cat)
+            count += n
+    ax_right.set_yticks(cat_ticks)
+    ax_right.set_yticklabels(cat_labels, fontsize=8, fontweight="bold", color=NAVY)
+    ax_right.tick_params(length=0)
+
+    pdf.savefig(fig, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ── PDF builder ───────────────────────────────────────────────────────────────
+
+def generate_pdf(df: pd.DataFrame, close: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        d = pdf.infodict()
+        d["Title"]   = f"ETF Weekly Report — {date.today()}"
+        d["Author"]  = "ETF Screener"
+        d["Subject"] = "Weekly ETF Performance"
+
+        page_cover(pdf, df)
+
+        for cat in CATEGORY_ORDER:
+            cat_df = df[df["Category"] == cat].copy()
+            if not cat_df.empty:
+                page_category(pdf, cat, cat_df, close)
+
+        page_trend(pdf, df, close)
+        page_heatmap(pdf, df)
+
+    return buf.getvalue()
 
 
 # ── Mailer ────────────────────────────────────────────────────────────────────
 
-def send_email(html: str) -> None:
-    host = os.environ["SMTP_HOST"]
-    port = int(os.environ.get("SMTP_PORT", 587))
-    user = os.environ["SMTP_USER"]
-    password = os.environ["SMTP_PASS"]
+def send_email(pdf_bytes: bytes) -> None:
+    host       = os.environ["SMTP_HOST"]
+    port       = int(os.environ.get("SMTP_PORT", 587))
+    user       = os.environ["SMTP_USER"]
+    password   = os.environ["SMTP_PASS"]
     recipients = [r.strip() for r in os.environ["EMAIL_RECIPIENT"].split(",")]
 
     today_str = date.today().strftime("%Y-%m-%d")
-    subject = f"ETF Weekly Recap — {today_str}"
+    subject   = f"ETF Weekly Report — {today_str}"
 
-    msg = MIMEMultipart("alternative")
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(html, "html"))
+    msg["From"]    = user
+    msg["To"]      = ", ".join(recipients)
 
-    log.info("Sending email to %s via %s:%d …", recipients, host, port)
+    html_intro = f"""
+    <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#333">
+      <div style="max-width:600px;margin:0 auto">
+        <div style="background:#1a1a2e;padding:20px 24px;border-radius:8px 8px 0 0">
+          <h2 style="margin:0;color:#f5c518">ETF Weekly Performance Report</h2>
+          <p style="margin:4px 0 0;color:#fff;opacity:.7;font-size:13px">{date.today().strftime('%B %d, %Y')}</p>
+        </div>
+        <div style="background:#f5f7fa;padding:20px 24px;border-radius:0 0 8px 8px">
+          <p>Your weekly ETF recap is attached as a PDF. It includes:</p>
+          <ul>
+            <li><b>Cover page</b> — top-{TOP_N} performers per period (5d / 3m / YTD / 1Y)</li>
+            <li><b>Category pages</b> — table with returns, volatility, beta, max drawdown, 52-week range + bar chart</li>
+            <li><b>Trend chart</b> — cumulative performance of top-8 ETFs over the last 3 months</li>
+            <li><b>Heatmap</b> — all ETFs × all periods, colour-coded and grouped by category</li>
+          </ul>
+          <p style="font-size:12px;color:#888;margin-top:16px">
+            Returns are dividend-adjusted. Simulated annual net subtracts the fund TER.
+            Past performance is not indicative of future results. Not financial advice.
+          </p>
+        </div>
+      </div>
+    </body></html>"""
+
+    msg.attach(MIMEText(html_intro, "html"))
+
+    att = MIMEApplication(pdf_bytes, _subtype="pdf")
+    att.add_header("Content-Disposition", "attachment",
+                   filename=f"etf_report_{today_str}.pdf")
+    msg.attach(att)
+
+    log.info("Sending to %s via %s:%d …", recipients, host, port)
     with smtplib.SMTP(host, port) as server:
         server.ehlo()
         server.starttls()
@@ -313,20 +552,19 @@ def send_email(html: str) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    df = fetch_returns(ETF_UNIVERSE)
+    df, close = fetch_data()
     if df.empty:
-        log.error("No ETF data retrieved — aborting.")
+        log.error("No data retrieved — aborting.")
         sys.exit(1)
 
-    html = build_html(df)
+    pdf_bytes = generate_pdf(df, close)
 
-    # Dump HTML locally for inspection when running manually
-    out_path = "/tmp/etf_recap.html"
-    with open(out_path, "w") as f:
-        f.write(html)
-    log.info("HTML preview written to %s", out_path)
+    out = "/tmp/etf_report.pdf"
+    with open(out, "wb") as f:
+        f.write(pdf_bytes)
+    log.info("PDF written to %s (%d KB)", out, len(pdf_bytes) // 1024)
 
-    send_email(html)
+    send_email(pdf_bytes)
 
 
 if __name__ == "__main__":

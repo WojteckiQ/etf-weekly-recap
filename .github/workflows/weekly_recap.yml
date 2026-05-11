@@ -43,5 +43,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: etf-recap-html
-          path: /tmp/etf_recap.html
+          path: /tmp/etf_report.pdf
           retention-days: 7
