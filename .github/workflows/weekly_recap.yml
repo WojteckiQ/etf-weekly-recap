@@ -1,0 +1,47 @@
+name: ETF Weekly Recap
+
+on:
+  schedule:
+    # Every Monday at 07:00 UTC
+    - cron: "0 7 * * 1"
+  workflow_dispatch:   # allow manual trigger
+
+jobs:
+  send-recap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ETF screener & send email
+        env:
+          SMTP_HOST:        ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:        ${{ secrets.SMTP_PORT }}
+          SMTP_USER:        ${{ secrets.SMTP_USER }}
+          SMTP_PASS:        ${{ secrets.SMTP_PASS }}
+          EMAIL_RECIPIENT:  ${{ secrets.EMAIL_RECIPIENT }}
+        run: python etf_screener.py
+
+      - name: Upload HTML preview (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etf-recap-html
+          path: /tmp/etf_recap.html
+          retention-days: 7
