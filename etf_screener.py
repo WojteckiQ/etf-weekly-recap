@@ -495,7 +495,110 @@ def generate_pdf(df: pd.DataFrame, close: pd.DataFrame) -> bytes:
 
 # ── Mailer ────────────────────────────────────────────────────────────────────
 
-def send_email(pdf_bytes: bytes) -> None:
+def _ret_cell(val) -> str:
+    """Return an HTML <td> with green/red colouring for a return value."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return '<td style="text-align:right;color:#aaa;padding:4px 8px">—</td>'
+    color = "#1e8449" if val >= 0 else "#c0392b"
+    bg    = "#eafaf1" if val >= 0 else "#fdedec"
+    return (f'<td style="text-align:right;color:{color};background:{bg};'
+            f'padding:4px 8px;font-weight:bold">{val:+.1f}%</td>')
+
+
+def _build_recap_html(df: pd.DataFrame) -> str:
+    """Build the full HTML recap table + highlights to embed in the email."""
+
+    # ── Highlights ──────────────────────────────────────────────────────────
+    def _highlights(col: str, label: str, n: int = 3) -> str:
+        sub = df.dropna(subset=[col])
+        if sub.empty:
+            return ""
+        top = sub.nlargest(n, col)
+        bot = sub.nsmallest(n, col)
+        rows_top = "".join(
+            f'<tr><td style="padding:2px 8px"><b>{r["Ticker"]}</b> {r["Name"][:28]}</td>'
+            f'<td style="text-align:right;color:#1e8449;font-weight:bold;padding:2px 8px">{r[col]:+.1f}%</td></tr>'
+            for _, r in top.iterrows()
+        )
+        rows_bot = "".join(
+            f'<tr><td style="padding:2px 8px"><b>{r["Ticker"]}</b> {r["Name"][:28]}</td>'
+            f'<td style="text-align:right;color:#c0392b;font-weight:bold;padding:2px 8px">{r[col]:+.1f}%</td></tr>'
+            for _, r in bot.iterrows()
+        )
+        return f"""
+        <table style="width:100%;border-collapse:collapse;margin-bottom:4px">
+          <tr>
+            <td style="width:50%;vertical-align:top">
+              <p style="margin:4px 0;font-size:12px;color:#555">Top {n} — {label}</p>
+              <table>{rows_top}</table>
+            </td>
+            <td style="width:50%;vertical-align:top">
+              <p style="margin:4px 0;font-size:12px;color:#555">Bottom {n} — {label}</p>
+              <table>{rows_bot}</table>
+            </td>
+          </tr>
+        </table>"""
+
+    hl_5d = _highlights("ret_5d", "This week (5d)")
+    hl_1y = _highlights("ret_1Y", "1 Year")
+
+    # ── Recap table ─────────────────────────────────────────────────────────
+    THEAD = """
+    <thead>
+      <tr style="background:#1a1a2e;color:#fff">
+        <th style="text-align:left;padding:6px 8px">Ticker</th>
+        <th style="text-align:left;padding:6px 8px">Name</th>
+        <th style="text-align:right;padding:6px 8px">TER</th>
+        <th style="text-align:right;padding:6px 8px">5d</th>
+        <th style="text-align:right;padding:6px 8px">3m</th>
+        <th style="text-align:right;padding:6px 8px">YTD</th>
+        <th style="text-align:right;padding:6px 8px">1Y</th>
+        <th style="text-align:right;padding:6px 8px">Sim 1Y net</th>
+        <th style="text-align:right;padding:6px 8px">Vol</th>
+        <th style="text-align:right;padding:6px 8px">MaxDD</th>
+      </tr>
+    </thead>"""
+
+    tbody_rows = ""
+    for cat in CATEGORY_ORDER:
+        cat_df = df[df["Category"] == cat].sort_values("ret_1Y", ascending=False, na_position="last")
+        if cat_df.empty:
+            continue
+        tbody_rows += (
+            f'<tr><td colspan="10" style="background:#eaf0fb;color:#1a1a2e;'
+            f'font-weight:bold;padding:5px 8px;font-size:12px">{cat}</td></tr>'
+        )
+        for i, (_, r) in enumerate(cat_df.iterrows()):
+            bg = "#ffffff" if i % 2 == 0 else "#f9fafb"
+            vol_str = f'{r["vol"]:.1f}%' if not np.isnan(r.get("vol", float("nan"))) else "—"
+            dd_val  = r.get("max_dd", float("nan"))
+            dd_str  = f'{dd_val:.1f}%' if not np.isnan(dd_val) else "—"
+            dd_color = "#c0392b" if not np.isnan(dd_val) else "#aaa"
+            tbody_rows += (
+                f'<tr style="background:{bg}">'
+                f'<td style="padding:4px 8px;font-weight:bold;color:#1a1a2e">{r["Ticker"]}</td>'
+                f'<td style="padding:4px 8px;color:#333;font-size:12px">{r["Name"][:32]}</td>'
+                f'<td style="text-align:right;padding:4px 8px;color:#888;font-size:11px">{r["TER"]*100:.2f}%</td>'
+                + _ret_cell(r.get("ret_5d"))
+                + _ret_cell(r.get("ret_3m"))
+                + _ret_cell(r.get("ret_YTD"))
+                + _ret_cell(r.get("ret_1Y"))
+                + _ret_cell(r.get("sim_1Y"))
+                + f'<td style="text-align:right;padding:4px 8px;color:#555;font-size:11px">{vol_str}</td>'
+                + f'<td style="text-align:right;padding:4px 8px;color:{dd_color};font-size:11px">{dd_str}</td>'
+                + "</tr>"
+            )
+
+    recap_table = f"""
+    <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:12px">
+      {THEAD}
+      <tbody>{tbody_rows}</tbody>
+    </table>"""
+
+    return hl_5d, hl_1y, recap_table
+
+
+def send_email(pdf_bytes: bytes, df: pd.DataFrame) -> None:
     host       = os.environ["SMTP_HOST"]
     port       = int(os.environ.get("SMTP_PORT", 587))
     user       = os.environ["SMTP_USER"]
@@ -510,26 +613,40 @@ def send_email(pdf_bytes: bytes) -> None:
     msg["From"]    = user
     msg["To"]      = ", ".join(recipients)
 
+    hl_5d, hl_1y, recap_table = _build_recap_html(df)
+
     html_intro = f"""
-    <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#333">
-      <div style="max-width:600px;margin:0 auto">
+    <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#333;margin:0;padding:0">
+      <div style="max-width:820px;margin:0 auto;padding:16px">
+
         <div style="background:#1a1a2e;padding:20px 24px;border-radius:8px 8px 0 0">
           <h2 style="margin:0;color:#f5c518">ETF Weekly Performance Report</h2>
           <p style="margin:4px 0 0;color:#fff;opacity:.7;font-size:13px">{date.today().strftime('%B %d, %Y')}</p>
         </div>
-        <div style="background:#f5f7fa;padding:20px 24px;border-radius:0 0 8px 8px">
-          <p>Your weekly ETF recap is attached as a PDF. It includes:</p>
-          <ul>
-            <li><b>Cover page</b> — top-{TOP_N} performers per period (5d / 3m / YTD / 1Y)</li>
-            <li><b>Category pages</b> — table with returns, volatility, beta, max drawdown, 52-week range + bar chart</li>
-            <li><b>Trend chart</b> — cumulative performance of top-8 ETFs over the last 3 months</li>
-            <li><b>Heatmap</b> — all ETFs × all periods, colour-coded and grouped by category</li>
-          </ul>
-          <p style="font-size:12px;color:#888;margin-top:16px">
-            Returns are dividend-adjusted. Simulated annual net subtracts the fund TER.
+
+        <div style="background:#f5f7fa;padding:16px 24px;border-top:3px solid #f5c518">
+          <h3 style="margin:0 0 8px;color:#1a1a2e;font-size:14px">Highlights</h3>
+          {hl_5d}
+          <hr style="border:none;border-top:1px solid #ddd;margin:10px 0">
+          {hl_1y}
+        </div>
+
+        <div style="background:#fff;padding:16px 24px">
+          <h3 style="margin:0 0 4px;color:#1a1a2e;font-size:14px">Full Recap — All ETFs by Category</h3>
+          <p style="margin:0 0 8px;font-size:12px;color:#888">
+            Returns are dividend-adjusted total return. <b>Sim 1Y net</b> = annualised gross return minus TER.
+            Vol = annualised daily volatility. MaxDD = max drawdown over 1 year.
+          </p>
+          {recap_table}
+        </div>
+
+        <div style="background:#f5f7fa;padding:12px 24px;border-radius:0 0 8px 8px">
+          <p style="font-size:11px;color:#aaa;margin:0">
+            Full charts (trend &amp; heatmap) are in the attached PDF.
             Past performance is not indicative of future results. Not financial advice.
           </p>
         </div>
+
       </div>
     </body></html>"""
 
@@ -564,7 +681,7 @@ def main() -> None:
         f.write(pdf_bytes)
     log.info("PDF written to %s (%d KB)", out, len(pdf_bytes) // 1024)
 
-    send_email(pdf_bytes)
+    send_email(pdf_bytes, df)
 
 
 if __name__ == "__main__":
